@@ -71,7 +71,13 @@ const resources = {
   "report-snapshots": "report_snapshots"
 };
 
-const readOnly = new Set(["stock-movements", "daily-summaries"]);
+const readOnly = new Set([
+  "stock-levels",
+  "stock-movements",
+  "stock-transfer-items",
+  "stock-audit-items",
+  "daily-summaries"
+]);
 
 function q(name) {
   if (!/^[a-zA-Z0-9_]+$/.test(String(name))) throw new Error("Invalid identifier");
@@ -187,25 +193,64 @@ async function createOpeningStock({
   staffId
 }) {
   if (!warehouseId) return;
-  const qty = toNumber(quantity, 0);
 
-  await connection.query(
-    `INSERT INTO stock_levels (warehouse_id, product_id, variant_id, quantity, reorder_point, reorder_qty)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    [warehouseId, productId, variantId, qty, toNumber(reorderPoint, 0), toNumber(reorderQty, 0)]
+  const qty = toNumber(quantity, 0);
+  const variantValue = emptyToNull(variantId);
+
+  const [existingRows] = await connection.query(
+    `SELECT id, quantity
+     FROM stock_levels
+     WHERE warehouse_id = ?
+       AND product_id = ?
+       AND variant_id <=> ?
+     LIMIT 1
+     FOR UPDATE`,
+    [warehouseId, productId, variantValue]
   );
+
+  const beforeQty = existingRows[0] ? toNumber(existingRows[0].quantity, 0) : 0;
+  const afterQty = beforeQty + qty;
+
+  if (existingRows[0]) {
+    await connection.query(
+      `UPDATE stock_levels
+       SET quantity = ?, reorder_point = ?, reorder_qty = ?
+       WHERE id = ?`,
+      [
+        afterQty,
+        toNumber(reorderPoint, 0),
+        toNumber(reorderQty, 0),
+        existingRows[0].id
+      ]
+    );
+  } else {
+    await connection.query(
+      `INSERT INTO stock_levels
+       (warehouse_id, product_id, variant_id, quantity, reorder_point, reorder_qty)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        warehouseId,
+        productId,
+        variantValue,
+        afterQty,
+        toNumber(reorderPoint, 0),
+        toNumber(reorderQty, 0)
+      ]
+    );
+  }
 
   if (qty !== 0) {
     await connection.query(
       `INSERT INTO stock_movements
        (warehouse_id, product_id, variant_id, movement_type, quantity, quantity_before, quantity_after, unit_cost, reference_type, reference_id, batch_number, expiry_date, notes, created_by)
-       VALUES (?, ?, ?, 'opening', ?, 0, ?, ?, 'product', ?, ?, ?, 'Opening stock from Add Product', ?)`,
+       VALUES (?, ?, ?, 'opening', ?, ?, ?, ?, 'product', ?, ?, ?, 'Opening stock from Add Product', ?)`,
       [
         warehouseId,
         productId,
-        variantId,
+        variantValue,
         qty,
-        qty,
+        beforeQty,
+        afterQty,
         emptyToNull(unitCost),
         productId,
         emptyToNull(batchNumber),
@@ -1394,6 +1439,759 @@ app.post("/api/pos/sales/complete", async (req, res) => {
     console.error(error);
     res.status(500).json({
       message: error.sqlMessage || error.message || "Failed to complete sale"
+    });
+  } finally {
+    connection.release();
+  }
+});
+
+function createReferenceNo(prefix) {
+  const date = new Date();
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  const random = Math.floor(1000 + Math.random() * 9000);
+  return `${prefix}-${y}${m}${d}-${Date.now().toString().slice(-6)}-${random}`;
+}
+
+function normalizeInventoryItem(raw = {}) {
+  return {
+    product_id: toNumber(raw.product_id, 0),
+    variant_id: emptyToNull(raw.variant_id),
+    quantity_sent: decimalQty(raw.quantity_sent ?? raw.quantity ?? 0),
+    quantity_received:
+      raw.quantity_received === undefined ||
+      raw.quantity_received === null ||
+      raw.quantity_received === ""
+        ? null
+        : decimalQty(raw.quantity_received),
+    counted_qty:
+      raw.counted_qty === undefined ||
+      raw.counted_qty === null ||
+      raw.counted_qty === ""
+        ? null
+        : decimalQty(raw.counted_qty)
+  };
+}
+
+function ensureInventoryItems(items) {
+  const normalized = (Array.isArray(items) ? items : []).map(normalizeInventoryItem);
+
+  if (!normalized.length) {
+    const error = new Error("At least one item is required");
+    error.status = 400;
+    throw error;
+  }
+
+  for (const item of normalized) {
+    if (!item.product_id) {
+      const error = new Error("Each item needs a product");
+      error.status = 400;
+      throw error;
+    }
+
+    if (item.quantity_sent <= 0) {
+      const error = new Error("Each item quantity must be greater than zero");
+      error.status = 400;
+      throw error;
+    }
+  }
+
+  return normalized;
+}
+
+async function getInventoryProduct(connection, productId, variantId = null) {
+  const variantValue = emptyToNull(variantId);
+
+  const [rows] = variantValue
+    ? await connection.query(
+        `SELECT
+           p.id AS product_id,
+           v.id AS variant_id,
+           CONCAT(p.name, ' - ', v.variant_name) AS description,
+           v.cost_price,
+           p.track_inventory,
+           p.allow_negative
+         FROM product_variants v
+         JOIN products p ON p.id = v.product_id
+         WHERE p.id = ? AND v.id = ? AND p.is_active = 1 AND v.is_active = 1
+         LIMIT 1`,
+        [productId, variantValue]
+      )
+    : await connection.query(
+        `SELECT
+           p.id AS product_id,
+           NULL AS variant_id,
+           p.name AS description,
+           p.cost_price,
+           p.track_inventory,
+           p.allow_negative
+         FROM products p
+         WHERE p.id = ? AND p.is_active = 1
+         LIMIT 1`,
+        [productId]
+      );
+
+  const product = rows[0];
+
+  if (!product) {
+    const error = new Error("Inventory product not found");
+    error.status = 404;
+    throw error;
+  }
+
+  if (Number(product.track_inventory) !== 1) {
+    const error = new Error(`${product.description} does not track inventory`);
+    error.status = 400;
+    throw error;
+  }
+
+  return product;
+}
+
+async function getStockLevelForUpdate(connection, warehouseId, productId, variantId = null) {
+  const [rows] = await connection.query(
+    `SELECT id, quantity, reorder_point, reorder_qty
+     FROM stock_levels
+     WHERE warehouse_id = ?
+       AND product_id = ?
+       AND variant_id <=> ?
+     LIMIT 1
+     FOR UPDATE`,
+    [warehouseId, productId, emptyToNull(variantId)]
+  );
+
+  return rows[0] || null;
+}
+
+async function applyStockChange({
+  connection,
+  warehouseId,
+  productId,
+  variantId = null,
+  quantityDelta,
+  movementType = "adjustment",
+  referenceType = "manual",
+  referenceId = null,
+  unitCost = null,
+  batchNumber = null,
+  expiryDate = null,
+  notes = null,
+  createdBy = null
+}) {
+  const delta = decimalQty(quantityDelta);
+  const variantValue = emptyToNull(variantId);
+
+  if (!warehouseId) {
+    const error = new Error("warehouse_id is required");
+    error.status = 400;
+    throw error;
+  }
+
+  if (!productId) {
+    const error = new Error("product_id is required");
+    error.status = 400;
+    throw error;
+  }
+
+  if (delta === 0) {
+    const error = new Error("Stock quantity change cannot be zero");
+    error.status = 400;
+    throw error;
+  }
+
+  const product = await getInventoryProduct(connection, productId, variantValue);
+  const stock = await getStockLevelForUpdate(connection, warehouseId, productId, variantValue);
+  const beforeQty = stock ? decimalQty(stock.quantity) : 0;
+  const afterQty = beforeQty + delta;
+
+  if (afterQty < 0 && Number(product.allow_negative) !== 1) {
+    const error = new Error(`Not enough stock for ${product.description}`);
+    error.status = 400;
+    throw error;
+  }
+
+  if (stock) {
+    await connection.query(
+      `UPDATE stock_levels
+       SET quantity = ?
+       WHERE id = ?`,
+      [afterQty, stock.id]
+    );
+  } else {
+    await connection.query(
+      `INSERT INTO stock_levels
+       (warehouse_id, product_id, variant_id, quantity, reorder_point, reorder_qty)
+       VALUES (?, ?, ?, ?, 0, 0)`,
+      [warehouseId, productId, variantValue, afterQty]
+    );
+  }
+
+  await connection.query(
+    `INSERT INTO stock_movements
+     (warehouse_id, product_id, variant_id, movement_type, quantity, quantity_before, quantity_after,
+      unit_cost, reference_type, reference_id, batch_number, expiry_date, notes, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      warehouseId,
+      productId,
+      variantValue,
+      movementType,
+      delta,
+      beforeQty,
+      afterQty,
+      emptyToNull(unitCost ?? product.cost_price),
+      referenceType,
+      emptyToNull(referenceId),
+      emptyToNull(batchNumber),
+      emptyToNull(expiryDate),
+      emptyToNull(notes),
+      emptyToNull(createdBy)
+    ]
+  );
+
+  return { beforeQty, afterQty, product };
+}
+
+async function loadTransferForUpdate(connection, transferId) {
+  const [rows] = await connection.query(
+    `SELECT *
+     FROM stock_transfers
+     WHERE id = ?
+     LIMIT 1
+     FOR UPDATE`,
+    [transferId]
+  );
+
+  const transfer = rows[0];
+
+  if (!transfer) {
+    const error = new Error("Stock transfer not found");
+    error.status = 404;
+    throw error;
+  }
+
+  return transfer;
+}
+
+async function sendTransfer(connection, transfer, staffId = null) {
+  if (transfer.status !== "draft") {
+    const error = new Error("Only draft transfers can be sent");
+    error.status = 400;
+    throw error;
+  }
+
+  const [items] = await connection.query(
+    `SELECT *
+     FROM stock_transfer_items
+     WHERE transfer_id = ?
+     FOR UPDATE`,
+    [transfer.id]
+  );
+
+  if (!items.length) {
+    const error = new Error("Transfer has no items");
+    error.status = 400;
+    throw error;
+  }
+
+  for (const item of items) {
+    const qty = decimalQty(item.quantity_sent);
+
+    await applyStockChange({
+      connection,
+      warehouseId: transfer.from_warehouse_id,
+      productId: item.product_id,
+      variantId: item.variant_id,
+      quantityDelta: -qty,
+      movementType: "transfer_out",
+      referenceType: "stock_transfer",
+      referenceId: transfer.id,
+      notes: `Transfer out ${transfer.reference_no}`,
+      createdBy: staffId || transfer.created_by
+    });
+  }
+
+  await connection.query(
+    `UPDATE stock_transfers
+     SET status = 'in_transit'
+     WHERE id = ?`,
+    [transfer.id]
+  );
+
+  transfer.status = "in_transit";
+  return transfer;
+}
+
+async function receiveTransfer(connection, transfer, staffId = null, receivedItems = []) {
+  if (transfer.status !== "in_transit") {
+    const error = new Error("Only in-transit transfers can be received");
+    error.status = 400;
+    throw error;
+  }
+
+  const [items] = await connection.query(
+    `SELECT *
+     FROM stock_transfer_items
+     WHERE transfer_id = ?
+     FOR UPDATE`,
+    [transfer.id]
+  );
+
+  if (!items.length) {
+    const error = new Error("Transfer has no items");
+    error.status = 400;
+    throw error;
+  }
+
+  const receivedMap = new Map(
+    (Array.isArray(receivedItems) ? receivedItems : []).map((item) => [
+      String(item.id || item.product_id),
+      item
+    ])
+  );
+
+  for (const item of items) {
+    const override = receivedMap.get(String(item.id)) || receivedMap.get(String(item.product_id));
+    const sentQty = decimalQty(item.quantity_sent);
+    const receivedQty = override
+      ? decimalQty(override.quantity_received ?? override.quantity ?? sentQty)
+      : sentQty;
+
+    if (receivedQty < 0 || receivedQty > sentQty) {
+      const error = new Error("Received quantity cannot be less than 0 or greater than sent quantity");
+      error.status = 400;
+      throw error;
+    }
+
+    if (receivedQty > 0) {
+      await applyStockChange({
+        connection,
+        warehouseId: transfer.to_warehouse_id,
+        productId: item.product_id,
+        variantId: item.variant_id,
+        quantityDelta: receivedQty,
+        movementType: "transfer_in",
+        referenceType: "stock_transfer",
+        referenceId: transfer.id,
+        notes: `Transfer in ${transfer.reference_no}`,
+        createdBy: staffId || transfer.received_by || transfer.created_by
+      });
+    }
+
+    await connection.query(
+      `UPDATE stock_transfer_items
+       SET quantity_received = ?
+       WHERE id = ?`,
+      [receivedQty, item.id]
+    );
+  }
+
+  await connection.query(
+    `UPDATE stock_transfers
+     SET status = 'received', received_by = ?, received_at = NOW()
+     WHERE id = ?`,
+    [emptyToNull(staffId || transfer.received_by), transfer.id]
+  );
+
+  transfer.status = "received";
+  return transfer;
+}
+
+app.post("/api/inventory/stock-adjustments", async (req, res) => {
+  const connection = await db.getConnection();
+  let tx = false;
+
+  try {
+    const body = req.body;
+    const allowedTypes = new Set(["adjustment", "damage", "expiry", "purchase", "return", "opening"]);
+    const movementType = allowedTypes.has(body.movement_type) ? body.movement_type : "adjustment";
+
+    await connection.beginTransaction();
+    tx = true;
+
+    const result = await applyStockChange({
+      connection,
+      warehouseId: body.warehouse_id,
+      productId: body.product_id,
+      variantId: body.variant_id,
+      quantityDelta: body.quantity_delta ?? body.quantity,
+      movementType,
+      referenceType: "manual_adjustment",
+      referenceId: null,
+      unitCost: body.unit_cost,
+      batchNumber: body.batch_number,
+      expiryDate: body.expiry_date,
+      notes: body.notes || "Manual stock adjustment",
+      createdBy: body.created_by
+    });
+
+    await connection.commit();
+    tx = false;
+
+    res.status(201).json({
+      message: "Stock adjusted successfully",
+      stock: result
+    });
+  } catch (error) {
+    if (tx) await connection.rollback().catch(() => {});
+    console.error(error);
+    res.status(error.status || 500).json({
+      message: error.sqlMessage || error.message || "Failed to adjust stock"
+    });
+  } finally {
+    connection.release();
+  }
+});
+
+app.post("/api/inventory/stock-transfers/full", async (req, res) => {
+  const connection = await db.getConnection();
+  let tx = false;
+
+  try {
+    const body = req.body;
+    const items = ensureInventoryItems(body.items);
+    const wantedStatus = ["draft", "in_transit", "received"].includes(body.status)
+      ? body.status
+      : "draft";
+
+    if (!body.from_warehouse_id) return res.status(400).json({ message: "from_warehouse_id is required" });
+    if (!body.to_warehouse_id) return res.status(400).json({ message: "to_warehouse_id is required" });
+
+    if (Number(body.from_warehouse_id) === Number(body.to_warehouse_id)) {
+      return res.status(400).json({ message: "From and To warehouse cannot be the same" });
+    }
+
+    await connection.beginTransaction();
+    tx = true;
+
+    const referenceNo = body.reference_no || createReferenceNo("TRF");
+
+    const [transferResult] = await connection.query(
+      `INSERT INTO stock_transfers
+       (from_warehouse_id, to_warehouse_id, reference_no, status, notes, created_by, received_by, received_at)
+       VALUES (?, ?, ?, 'draft', ?, ?, NULL, NULL)`,
+      [
+        body.from_warehouse_id,
+        body.to_warehouse_id,
+        referenceNo,
+        emptyToNull(body.notes),
+        emptyToNull(body.created_by)
+      ]
+    );
+
+    const transferId = transferResult.insertId;
+
+    for (const item of items) {
+      await getInventoryProduct(connection, item.product_id, item.variant_id);
+
+      await connection.query(
+        `INSERT INTO stock_transfer_items
+         (transfer_id, product_id, variant_id, quantity_sent, quantity_received)
+         VALUES (?, ?, ?, ?, NULL)`,
+        [transferId, item.product_id, emptyToNull(item.variant_id), item.quantity_sent]
+      );
+    }
+
+    let transfer = await loadTransferForUpdate(connection, transferId);
+
+    if (wantedStatus === "in_transit" || wantedStatus === "received") {
+      transfer = await sendTransfer(connection, transfer, body.created_by);
+    }
+
+    if (wantedStatus === "received") {
+      transfer = await receiveTransfer(
+        connection,
+        transfer,
+        body.received_by || body.created_by,
+        items
+      );
+    }
+
+    await connection.commit();
+    tx = false;
+
+    res.status(201).json({
+      message: "Stock transfer saved successfully",
+      transfer: { id: transferId, reference_no: referenceNo, status: transfer.status }
+    });
+  } catch (error) {
+    if (tx) await connection.rollback().catch(() => {});
+    console.error(error);
+    res.status(error.status || 500).json({
+      message: error.sqlMessage || error.message || "Failed to save stock transfer"
+    });
+  } finally {
+    connection.release();
+  }
+});
+
+app.post("/api/inventory/stock-transfers/:id/send", async (req, res) => {
+  const connection = await db.getConnection();
+  let tx = false;
+
+  try {
+    await connection.beginTransaction();
+    tx = true;
+
+    const transfer = await loadTransferForUpdate(connection, req.params.id);
+    await sendTransfer(connection, transfer, req.body.created_by);
+
+    await connection.commit();
+    tx = false;
+
+    res.json({ message: "Stock transfer sent" });
+  } catch (error) {
+    if (tx) await connection.rollback().catch(() => {});
+    console.error(error);
+    res.status(error.status || 500).json({
+      message: error.sqlMessage || error.message || "Failed to send stock transfer"
+    });
+  } finally {
+    connection.release();
+  }
+});
+
+app.post("/api/inventory/stock-transfers/:id/receive", async (req, res) => {
+  const connection = await db.getConnection();
+  let tx = false;
+
+  try {
+    await connection.beginTransaction();
+    tx = true;
+
+    const transfer = await loadTransferForUpdate(connection, req.params.id);
+    await receiveTransfer(
+      connection,
+      transfer,
+      req.body.received_by || req.body.created_by,
+      req.body.items || []
+    );
+
+    await connection.commit();
+    tx = false;
+
+    res.json({ message: "Stock transfer received" });
+  } catch (error) {
+    if (tx) await connection.rollback().catch(() => {});
+    console.error(error);
+    res.status(error.status || 500).json({
+      message: error.sqlMessage || error.message || "Failed to receive stock transfer"
+    });
+  } finally {
+    connection.release();
+  }
+});
+
+app.post("/api/inventory/stock-audits/full", async (req, res) => {
+  const connection = await db.getConnection();
+  let tx = false;
+
+  try {
+    const body = req.body;
+
+    const items = ensureInventoryItems(
+      (Array.isArray(body.items) ? body.items : []).map((item) => ({
+        ...item,
+        quantity_sent: item.quantity_sent ?? 1
+      }))
+    );
+
+    const wantedStatus =
+      body.status === "completed"
+        ? "completed"
+        : body.status === "in_progress"
+          ? "in_progress"
+          : "draft";
+
+    if (!body.warehouse_id) return res.status(400).json({ message: "warehouse_id is required" });
+
+    await connection.beginTransaction();
+    tx = true;
+
+    const referenceNo = body.reference_no || createReferenceNo("AUD");
+
+    const [auditResult] = await connection.query(
+      `INSERT INTO stock_audits
+       (warehouse_id, reference_no, status, notes, conducted_by, completed_at)
+       VALUES (?, ?, ?, ?, ?, NULL)`,
+      [
+        body.warehouse_id,
+        referenceNo,
+        wantedStatus === "completed" ? "in_progress" : wantedStatus,
+        emptyToNull(body.notes),
+        emptyToNull(body.conducted_by)
+      ]
+    );
+
+    const auditId = auditResult.insertId;
+
+    for (const item of items) {
+      await getInventoryProduct(connection, item.product_id, item.variant_id);
+
+      const stock = await getStockLevelForUpdate(
+        connection,
+        body.warehouse_id,
+        item.product_id,
+        item.variant_id
+      );
+
+      const systemQty = stock ? decimalQty(stock.quantity) : 0;
+
+      if (wantedStatus === "completed" && item.counted_qty === null) {
+        const error = new Error("Counted quantity is required when completing an audit");
+        error.status = 400;
+        throw error;
+      }
+
+      await connection.query(
+        `INSERT INTO stock_audit_items
+         (audit_id, product_id, variant_id, system_qty, counted_qty)
+         VALUES (?, ?, ?, ?, ?)`,
+        [auditId, item.product_id, emptyToNull(item.variant_id), systemQty, item.counted_qty]
+      );
+    }
+
+    if (wantedStatus === "completed") {
+      await completeAudit(connection, auditId, {
+        conducted_by: body.conducted_by,
+        items
+      });
+    }
+
+    await connection.commit();
+    tx = false;
+
+    res.status(201).json({
+      message: "Stock audit saved successfully",
+      audit: { id: auditId, reference_no: referenceNo, status: wantedStatus }
+    });
+  } catch (error) {
+    if (tx) await connection.rollback().catch(() => {});
+    console.error(error);
+    res.status(error.status || 500).json({
+      message: error.sqlMessage || error.message || "Failed to save stock audit"
+    });
+  } finally {
+    connection.release();
+  }
+});
+
+async function completeAudit(connection, auditId, body = {}) {
+  const [auditRows] = await connection.query(
+    `SELECT *
+     FROM stock_audits
+     WHERE id = ?
+     LIMIT 1
+     FOR UPDATE`,
+    [auditId]
+  );
+
+  const audit = auditRows[0];
+
+  if (!audit) {
+    const error = new Error("Stock audit not found");
+    error.status = 404;
+    throw error;
+  }
+
+  if (audit.status === "completed") {
+    const error = new Error("Stock audit is already completed");
+    error.status = 400;
+    throw error;
+  }
+
+  const updateMap = new Map(
+    (Array.isArray(body.items) ? body.items : []).map((item) => [
+      String(item.id || item.product_id),
+      item
+    ])
+  );
+
+  const [items] = await connection.query(
+    `SELECT *
+     FROM stock_audit_items
+     WHERE audit_id = ?
+     FOR UPDATE`,
+    [auditId]
+  );
+
+  if (!items.length) {
+    const error = new Error("Stock audit has no items");
+    error.status = 400;
+    throw error;
+  }
+
+  for (const item of items) {
+    const override = updateMap.get(String(item.id)) || updateMap.get(String(item.product_id));
+
+    const countedQty = override
+      ? decimalQty(override.counted_qty)
+      : item.counted_qty === null || item.counted_qty === undefined
+        ? null
+        : decimalQty(item.counted_qty);
+
+    if (countedQty === null) {
+      const error = new Error("Every audit item needs counted_qty before completing");
+      error.status = 400;
+      throw error;
+    }
+
+    if (override) {
+      await connection.query(
+        `UPDATE stock_audit_items
+         SET counted_qty = ?
+         WHERE id = ?`,
+        [countedQty, item.id]
+      );
+    }
+
+    const systemQty = decimalQty(item.system_qty);
+    const variance = countedQty - systemQty;
+
+    if (variance !== 0) {
+      await applyStockChange({
+        connection,
+        warehouseId: audit.warehouse_id,
+        productId: item.product_id,
+        variantId: item.variant_id,
+        quantityDelta: variance,
+        movementType: "adjustment",
+        referenceType: "stock_audit",
+        referenceId: auditId,
+        notes: `Stock audit ${audit.reference_no}`,
+        createdBy: body.conducted_by || audit.conducted_by
+      });
+    }
+  }
+
+  await connection.query(
+    `UPDATE stock_audits
+     SET status = 'completed', conducted_by = ?, completed_at = NOW()
+     WHERE id = ?`,
+    [emptyToNull(body.conducted_by || audit.conducted_by), auditId]
+  );
+}
+
+app.post("/api/inventory/stock-audits/:id/complete", async (req, res) => {
+  const connection = await db.getConnection();
+  let tx = false;
+
+  try {
+    await connection.beginTransaction();
+    tx = true;
+
+    await completeAudit(connection, req.params.id, req.body);
+
+    await connection.commit();
+    tx = false;
+
+    res.json({ message: "Stock audit completed" });
+  } catch (error) {
+    if (tx) await connection.rollback().catch(() => {});
+    console.error(error);
+    res.status(error.status || 500).json({
+      message: error.sqlMessage || error.message || "Failed to complete stock audit"
     });
   } finally {
     connection.release();
